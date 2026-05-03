@@ -7,9 +7,9 @@ A Production-Grade Academic RAG Framework for CVPR/IEEE/NeurIPS Literature
 
 ## 📖 项目简介
 
-**ScholarRAG** 是一款专为科研人员与 AI 开发者打造的高性能学术文献检索增强生成（RAG）系统。项目深度参考顶级综述《Retrieval-Augmented Generation for Large Language Models: A Survey》，针对顶会论文排版复杂、表格公式密集、知识更新快等核心痛点，构建了一套从“结构化解析 → 混合检索 → 迭代生成 → 引用溯源”的完整工程闭环。
+**ScholarRAG** 是一款专为科研人员与 AI 开发者打造的高性能学术文献检索增强生成系统。项目深度参考顶级综述《Retrieval-Augmented Generation for Large Language Models: A Survey》，针对顶会论文排版复杂、表格公式密集、知识更新快等核心痛点，构建了一套从“结构化解析 → 混合检索 → 迭代生成 → 引用溯源”的完整工程闭环。
 
-系统支持本地大模型与在线 API 无缝路由，旨在让大模型真正“读懂”论文、精准提取实验指标、杜绝幻觉输出，助力科研写作、文献调研与指标对比自动化。
+系统支持本地大模型与在线 API 无缝路由，旨在让大模型真正读懂论文、精准提取实验指标、杜绝幻觉输出，助力科研写作、文献调研与指标对比自动化。
 
 ---
 
@@ -37,11 +37,22 @@ A Production-Grade Academic RAG Framework for CVPR/IEEE/NeurIPS Literature
 
 ---
 
-##  快速开始
+## 快速开始
 
-### 1. 环境准备
+### 环境准备
 ```bash
 # 克隆项目并安装依赖
-git clone https://github.com/your-username/scholar-rag.git
-cd scholar-rag
+git clone https://github.com/lxcshine/ScholarRAG.git
+cd ScholarRAG
 pip install -r requirements.txt
+
+# 启动Ollama并拉取学术嵌入模型
+ollama pull bge-m3
+ollama serve
+
+# 将 CVPR/IEEE 等 PDF 放入 ./papers 目录
+mkdir papers
+# 重建向量索引（自动执行版面解析与分块）
+python main.py --rebuild --mode fast
+# 启动交互式问答系统
+python main.py --mode fast
