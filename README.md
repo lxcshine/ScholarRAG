@@ -16,7 +16,7 @@ A Production-Grade Academic RAG Framework for CVPR/IEEE/NeurIPS Literature
 ## 🌟 核心亮点
 
 ### 1. Advanced + Modular 混合检索架构
-摒弃传统 Naive RAG 的单一检索链路，采用 `BM25 关键词 + Dense Vector 语义 + CrossEncoder 重排序` 三路混合检索管线。结合 **HyDE 假设文档生成** 与 **多视角查询重写**，显著提升长尾学术概念与专业术语的召回率。内置多轮迭代检索与 LLM 驱动的**“信息充分性自检”机制**，系统可自主判断上下文是否完备并动态补全缺失指标，复杂汇总类查询命中率提升 30%+。
+摒弃传统Naive RAG的单一检索链路，采用`BM25 关键词 + Dense Vector语义 + CrossEncoder重排序`三路混合检索管线。结合 **HyDE 假设文档生成** 与 **多视角查询重写**，显著提升长尾学术概念与专业术语的召回率。内置多轮迭代检索与LLM驱动的**信息充分性自检机制**，系统可自主判断上下文是否完备并动态补全缺失指标，复杂汇总类查询命中率提升30%+。
 
 ### 2. 面向顶会论文的原子化分块与强溯源防幻觉
 针对双栏排版、三线表与 LaTeX 公式易断裂的问题，提出 `Small2Big + Metadata Attachments + Structural Index` 分块策略，实现**表格原子化保留**、章节上下文绑定与元数据路由。生成阶段采用 Token 级安全压缩与 `[DocID]` 强制引用校验模块，无效或越界引用自动拦截替换。从源头切断大模型“胡编乱造”，输出结果结构清晰、来源可溯，可直接粘贴至论文实验对比或 Related Work 章节。
