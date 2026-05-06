@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-科研RAG系统主入口
-支持本地Ollama / 在线GLM-4.5 一键切换
-嵌入模型固定使用本地 bge-m3
+Research RAG System Main Entry
+Supports local Ollama / online GLM-4.5 one-click switching
+Embedding model fixed to local qwen3-embedding:0.6b
 """
 
 import sys
@@ -14,7 +14,6 @@ import time
 import requests
 from pathlib import Path
 
-# 确保项目根目录在 sys.path 中
 from langchain_ollama import ChatOllama
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -25,15 +24,19 @@ from utils.chunker import chunk_documents
 from core.vector_store import init_vector_store, load_vector_store
 from core.reranker import Reranker
 from core.llm_router import LLMRouter
+from core.table_processor import TableProcessor
 from pipeline.context_manager import ContextManager
 from pipeline.iterative_agent import IterativeRAGAgent
+from pipeline.conversation_memory import ConversationMemory
 from generator.citation_validator import validate_citations
 
 logger = logging.getLogger(__name__)
 
+table_processor = TableProcessor()
+
 
 def apply_mode_preset(mode: str):
-    """根据运行模式动态调整检索策略参数"""
+    """Dynamically adjust retrieval strategy parameters based on mode"""
     mode_presets = {
         "fast": {
             "MAX_ITERATIONS": 1,
@@ -66,11 +69,11 @@ def apply_mode_preset(mode: str):
     preset = mode_presets.get(mode, mode_presets["balanced"])
     for key, value in preset.items():
         setattr(settings, key, value)
-    logger.info(f"🎛️ 检索模式已切换: {mode.upper()} | 迭代: {settings.MAX_ITERATIONS} | Top-K: {settings.TOP_K_RETRIEVAL}")
+    logger.info(f"Retrieval mode switched: {mode.upper()} | Iterations: {settings.MAX_ITERATIONS} | Top-K: {settings.TOP_K_RETRIEVAL}")
 
 
 def check_llm_health() -> bool:
-    """检测当前配置的LLM服务是否可用"""
+    """Check if the configured LLM service is available"""
     mode = settings.LLM_MODE
     if mode == "local":
         try:
@@ -78,13 +81,13 @@ def check_llm_health() -> bool:
             if resp.status_code == 200:
                 models = [m["name"] for m in resp.json().get("models", [])]
                 if settings.LOCAL_LLM_MODEL in models:
-                    logger.info(f"✅ 本地模型就绪: {settings.LOCAL_LLM_MODEL}")
+                    logger.info(f"Local model ready: {settings.LOCAL_LLM_MODEL}")
                     return True
                 else:
-                    logger.warning(f"⚠️ 模型 {settings.LOCAL_LLM_MODEL} 未找到，可用: {models}")
+                    logger.warning(f"Model {settings.LOCAL_LLM_MODEL} not found, available: {models}")
                     return False
         except Exception as e:
-            logger.error(f"❌ 无法连接 Ollama: {e}")
+            logger.error(f"Cannot connect to Ollama: {e}")
             return False
     else:  # online
         try:
@@ -95,76 +98,161 @@ def check_llm_health() -> bool:
                 timeout=10
             )
             if resp.status_code == 200:
-                logger.info(f"✅ 在线模型就绪: {settings.ONLINE_LLM_MODEL}")
+                logger.info(f"Online model ready: {settings.ONLINE_LLM_MODEL}")
                 return True
             else:
-                logger.error(f"❌ GLM API 返回异常: {resp.status_code} - {resp.text}")
+                logger.error(f"GLM API returned error: {resp.status_code} - {resp.text}")
                 return False
         except Exception as e:
-            logger.error(f"❌ 无法连接 GLM 服务: {e}")
+            logger.error(f"Cannot connect to GLM service: {e}")
             return False
     return False
 
 
-def rebuild_index():
-    """重建向量数据库与混合检索索引"""
-    logger.info("🔄 开始重建向量索引...")
+def rebuild_index(force_rebuild: bool = False):
+    """Rebuild or incrementally update vector database"""
+    logger.info("Starting vector index update...")
     pdf_dir = Path(settings.PDF_DIR)
 
     if not pdf_dir.exists():
         pdf_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"📁 已创建目录: {pdf_dir}")
-        logger.info("💡 请将CVPR/IEEE/NeurIPS等PDF论文放入该目录后重试")
+        logger.info(f"Directory created: {pdf_dir}")
+        logger.info("Please place CVPR/IEEE/NeurIPS PDF papers in this directory and retry")
         return
 
-    # 解析PDF
-    docs = []
+    # Check for existing vector store and indexed files
+    vstore = load_vector_store() if not force_rebuild else None
+    indexed_files = set()
+    
+    if vstore:
+        try:
+            all_docs = vstore.get()
+            if all_docs and all_docs.get("metadatas"):
+                for meta in all_docs["metadatas"]:
+                    if "source_file" in meta:
+                        indexed_files.add(meta["source_file"])
+                logger.info(f"Found existing index with {len(indexed_files)} files")
+        except Exception as e:
+            logger.warning(f"Failed to read existing index metadata: {e}")
+            vstore = None
+
+    # Find new PDF files
     pdf_files = list(pdf_dir.glob("*.pdf"))
     if not pdf_files:
-        logger.warning(f"⚠️ {pdf_dir} 目录下未找到PDF文件")
+        logger.warning(f"No PDF files found in {pdf_dir}")
         return
 
+    new_files = []
+    existing_files = []
     for p in pdf_files:
-        logger.info(f"📖 解析: {p.name}")
+        if str(p) in indexed_files or p.name in indexed_files:
+            existing_files.append(p)
+        else:
+            new_files.append(p)
+
+    if not new_files and not force_rebuild:
+        logger.info(f"All {len(pdf_files)} files already indexed. No updates needed.")
+        logger.info("Use --rebuild to force full reindex, or add new PDFs to papers/ directory")
+        return
+
+    if new_files:
+        logger.info(f"Found {len(new_files)} new file(s) to index")
+        for p in new_files:
+            logger.info(f"  New: {p.name}")
+    
+    if existing_files and force_rebuild:
+        logger.info(f"Force rebuild: re-indexing all {len(pdf_files)} files")
+
+    files_to_process = new_files if not force_rebuild else pdf_files
+
+    # Parse PDFs
+    docs = []
+    for p in files_to_process:
+        logger.info(f"Parsing: {p.name}")
         try:
-            docs.append(extract_pdf(str(p)))
+            doc = extract_pdf(str(p))
+            doc.metadata["source_file"] = str(p)
+            doc.metadata["source_filename"] = p.name
+            docs.append(doc)
         except Exception as e:
-            logger.error(f"❌ 解析失败 {p.name}: {e}")
+            logger.error(f"Failed to parse {p.name}: {e}")
 
     valid_docs = [d for d in docs if d.page_content.strip()]
     if not valid_docs:
-        logger.error("❌ 未找到有效内容，索引终止")
+        logger.error("No valid content found, index terminated")
         return
 
-    # 高级分块
-    logger.info(f"🔪 开始分块: {len(valid_docs)} 篇文献")
+    # Advanced chunking
+    logger.info(f"Starting chunking: {len(valid_docs)} papers")
     chunks = chunk_documents(valid_docs)
-    logger.info(f"✅ 分块完成: {len(chunks)} 个索引块")
+    logger.info(f"Chunking complete: {len(chunks)} index chunks")
 
-    # 初始化向量库
-    logger.info("💾 正在构建向量索引...")
-    init_vector_store(chunks)
-    logger.info(f"🎉 索引重建成功! 耗时: {time.time():.1f}s")
+    # Extract table schemas from documents
+    logger.info("Extracting table schemas...")
+    for doc in valid_docs:
+        doc_id = doc.metadata.get("doc_id", "unknown")
+        section = doc.metadata.get("section", "")
+        try:
+            schemas = table_processor.extract_tables_from_markdown(
+                doc.page_content,
+                doc_id=doc_id,
+                section=section
+            )
+            if schemas:
+                logger.info(f"Extracted {len(schemas)} table schemas from {doc_id}")
+        except Exception as e:
+            logger.warning(f"Failed to extract tables from {doc_id}: {e}")
+
+    # Add table schema documents to vector store
+    table_docs = table_processor.generate_schema_docs()
+    if table_docs:
+        logger.info(f"Adding {len(table_docs)} table schema documents to vector store")
+        chunks.extend(table_docs)
+
+    # Initialize or update vector store
+    if vstore and not force_rebuild and new_files:
+        logger.info(f"Adding {len(chunks)} new chunks to existing index...")
+        from core.embedder import get_embedder
+        embedder = get_embedder()
+        
+        batch_size = settings.EMBEDDING_BATCH_SIZE
+        total = len(chunks)
+        logger.info(f"Embedding new content: {total} chunks in batches of {batch_size}")
+        
+        for i in range(0, total, batch_size):
+            batch = chunks[i:i + batch_size]
+            vstore.add_documents(batch)
+            processed = min(i + batch_size, total)
+            progress = processed / total * 100
+            logger.info(f"Embedding progress: {processed}/{total} ({progress:.1f}%)")
+        
+        logger.info(f"Incremental index update complete! Total files: {len(pdf_files)}")
+    else:
+        logger.info("Building vector index...")
+        init_vector_store(chunks)
+        logger.info(f"Full index rebuild complete!")
+    
+    logger.info(f"Index update finished. Time: {time.time():.1f}s")
 
 
 def run_interactive():
-    """启动交互式问答循环"""
-    # 健康检查
+    """Start interactive Q&A loop"""
+    # Health check
     if not check_llm_health():
-        logger.error("❌ LLM服务未就绪，请检查配置后重试")
+        logger.error("LLM service not ready, please check configuration and retry")
         return
 
-    # 加载向量库
+    # Load vector store
     vstore = load_vector_store()
     if not vstore:
-        logger.info("📦 未检测到向量库，自动触发重建...")
+        logger.info("Vector store not detected, auto-triggering rebuild...")
         rebuild_index()
         vstore = load_vector_store()
         if not vstore:
-            logger.error("❌ 向量库加载失败，退出")
+            logger.error("Vector store loading failed, exiting")
             return
 
-    # 初始化核心组件（使用路由获取LLM）
+    # Initialize core components
     if settings.LLM_MODE == "online":
         from langchain_openai import ChatOpenAI
         llm = ChatOpenAI(
@@ -186,81 +274,110 @@ def run_interactive():
 
     reranker = Reranker()
     ctx_mgr = ContextManager(vstore, reranker, llm)
-    agent = IterativeRAGAgent(ctx_mgr, llm)
+    conv_memory = ConversationMemory(
+        max_turns=settings.MAX_CONVERSATION_TURNS,
+        max_tokens=settings.MAX_CONVERSATION_TOKENS,
+        enable_summary=settings.ENABLE_CONVERSATION_SUMMARY
+    )
+    agent = IterativeRAGAgent(ctx_mgr, llm, conversation_memory=conv_memory)
 
-    # 启动信息
+    # Startup info
     print("\n" + "=" * 70)
-    print(f"🚀 RAG科研系统已启动")
-    print(f"   📊 模式: {settings.RETRIEVAL_MODE.upper()}")
-    print(
-        f"   🤖 生成模型: {settings.LLM_MODE.upper()} ({settings.ONLINE_LLM_MODEL if settings.LLM_MODE == 'online' else settings.LOCAL_LLM_MODEL})")
-    print(f"   🔍 嵌入模型: {settings.EMBEDDING_MODEL} (本地)")
+    print("RAG Research System Started")
+    print(f"   Mode: {settings.RETRIEVAL_MODE.upper()}")
+    print(f"   Generation Model: {settings.LLM_MODE.upper()} ({settings.ONLINE_LLM_MODEL if settings.LLM_MODE == 'online' else settings.LOCAL_LLM_MODEL})")
+    print(f"   Embedding Model: {settings.EMBEDDING_MODEL} (local)")
+    print(f"   Memory Retrieval: {'RF-Mem Dual-Path' if settings.ENABLE_RF_MEM else 'Standard'}")
+    print(f"   Conversation Memory: {'Enabled' if settings.ENABLE_CONVERSATION_MEMORY else 'Disabled'}")
     print("=" * 70)
-    print("💡 快捷命令:")
-    print("   • mode fast|balanced|accurate  : 切换检索策略")
-    print("   • model local|online           : 切换生成模型")
-    print("   • exit / quit / q              : 退出系统")
+    print("Quick Commands:")
+    print("   - mode fast|balanced|accurate  : Switch retrieval strategy")
+    print("   - model local|online           : Switch generation model")
+    print("   - memory status/clear          : View/clear conversation memory")
+    print("   - exit / quit / q              : Exit system")
     print("=" * 70)
 
     while True:
         try:
-            user_input = input("\n🔍 你的查询: ").strip()
+            user_input = input("\nYour query: ").strip()
             if not user_input:
                 continue
 
-            # 命令: 切换检索模式
+            # Command: Switch retrieval mode
             if user_input.lower().startswith("mode "):
                 parts = user_input.split()
                 if len(parts) == 2 and parts[1] in ["fast", "balanced", "accurate"]:
                     apply_mode_preset(parts[1])
                     settings.RETRIEVAL_MODE = parts[1]
-                    # 重新初始化agent以应用新参数
-                    agent = IterativeRAGAgent(ctx_mgr, llm)
-                    print(f"✅ 检索策略已切换: {parts[1].upper()}")
+                    agent = IterativeRAGAgent(ctx_mgr, llm, conversation_memory=conv_memory)
+                    print(f"Retrieval strategy switched: {parts[1].upper()}")
                 else:
-                    print("❌ 用法: mode fast | balanced | accurate")
+                    print("Usage: mode fast | balanced | accurate")
                 continue
 
-            # 命令: 切换生成模型
+            # Command: Switch generation model
             if user_input.lower().startswith("model "):
                 parts = user_input.split()
                 if len(parts) == 2 and parts[1] in ["local", "online"]:
                     if LLMRouter.switch_mode(parts[1]):
-                        # 重新获取新模型的LLM实例
                         llm = LLMRouter.get_llm()
                         ctx_mgr.llm = llm
-                        agent = IterativeRAGAgent(ctx_mgr, llm)
+                        agent = IterativeRAGAgent(ctx_mgr, llm, conversation_memory=conv_memory)
                         model_name = settings.ONLINE_LLM_MODEL if parts[1] == "online" else settings.LOCAL_LLM_MODEL
-                        print(f"✅ 生成模型已切换: {parts[1].upper()} ({model_name})")
+                        print(f"Generation model switched: {parts[1].upper()} ({model_name})")
                     else:
-                        print("❌ 切换失败，请检查配置")
+                        print("Switch failed, please check configuration")
                 else:
-                    print("❌ 用法: model local | online")
+                    print("Usage: model local | online")
                 continue
 
-            # 退出命令
-            if user_input.lower() in ["exit", "quit", "q", "退出"]:
-                print("\n👋 感谢使用，已安全退出。")
+            # Command: Conversation memory management
+            if user_input.lower().startswith("memory "):
+                parts = user_input.split()
+                if len(parts) == 2:
+                    if parts[1] == "status":
+                        if conv_memory:
+                            info = conv_memory.get_session_info()
+                            print(f"\nConversation Memory Status:")
+                            print(f"   Turns: {info['turn_count']}")
+                            print(f"   Messages: {info['message_count']}")
+                            print(f"   Session Duration: {info['session_duration']:.0f}s")
+                            print(f"   Summary: {'Yes' if info['has_summary'] else 'No'}")
+                        else:
+                            print("Conversation memory not enabled")
+                    elif parts[1] == "clear":
+                        if conv_memory:
+                            conv_memory.clear()
+                            print("Conversation memory cleared")
+                        else:
+                            print("Conversation memory not enabled")
+                    else:
+                        print("Usage: memory status | clear")
+                continue
+
+            # Exit command
+            if user_input.lower() in ["exit", "quit", "q"]:
+                print("\nThank you for using, exiting safely.")
                 break
 
-            # 执行检索与生成
+            # Execute retrieval and generation
             start_time = time.time()
-            print(f"⏳ 正在执行智能检索 (模式: {settings.RETRIEVAL_MODE})...")
+            print(f"Executing intelligent retrieval (mode: {settings.RETRIEVAL_MODE})...")
 
             raw_response = agent.run(user_input)
             elapsed = time.time() - start_time
 
-            # 后处理: 引用校验
+            # Post-processing: Citation validation
             validated_response = validate_citations(raw_response, getattr(ctx_mgr, 'last_docs', []))
 
-            # 输出结果
-            print(f"\n⏱️ 耗时: {elapsed:.2f}s")
+            # Output results
+            print(f"\nTime: {elapsed:.2f}s")
             print("=" * 70)
-            print("📝 生成结果:")
+            print("Generated Result:")
             print("=" * 70)
             print(validated_response)
 
-            # 持久化保存
+            # Persistent save
             timestamp = int(time.time())
             output_file = f"answer_{timestamp}.md"
             with open(output_file, "w", encoding="utf-8") as f:
@@ -268,72 +385,152 @@ def run_interactive():
                 f.write(f"# Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"# Mode: {settings.RETRIEVAL_MODE} | Model: {settings.LLM_MODE}\n\n")
                 f.write(validated_response)
-            print(f"\n✅ 已自动保存至: {output_file}")
+            print(f"\nAutomatically saved to: {output_file}")
 
         except KeyboardInterrupt:
-            print("\n\n⚠️ 检测到中断信号，正在安全退出...")
+            print("\n\nInterrupt detected, exiting safely...")
             break
         except Exception as e:
-            logger.error(f"❌ 运行时异常: {e}", exc_info=True)
-            print(f"⚠️ 发生错误: {type(e).__name__}")
-            print("💡 建议: 检查日志或重试，复杂查询可尝试 mode accurate")
+            logger.error(f"Runtime error: {e}", exc_info=True)
+            print(f"Error occurred: {type(e).__name__}")
+            print("Suggestion: Check logs or retry, try mode accurate for complex queries")
+
+
+def run_web_server(host: str = "0.0.0.0", port: int = 8000):
+    """Start web server with browser auto-open after server is ready"""
+    import webbrowser
+    import threading
+    import uvicorn
+    import time
+    import socket
+    
+    url = f"http://localhost:{port}"
+    
+    def wait_for_server_ready():
+        """Poll the port until server is ready, then open browser"""
+        max_wait = 120  # Maximum wait time in seconds
+        check_interval = 0.5  # Check every 0.5 seconds
+        elapsed = 0
+        
+        print("\nWaiting for server to be ready...")
+        
+        while elapsed < max_wait:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                result = sock.connect_ex(('127.0.0.1', port))
+                sock.close()
+                
+                if result == 0:
+                    print(f"Server is ready! Opening browser...")
+                    time.sleep(0.5)  # Small delay to ensure server is fully initialized
+                    webbrowser.open(url)
+                    return
+            except Exception:
+                pass
+            
+            time.sleep(check_interval)
+            elapsed += check_interval
+        
+        print(f"Warning: Server did not become ready within {max_wait} seconds")
+    
+    # Start browser opener thread
+    browser_thread = threading.Thread(target=wait_for_server_ready, daemon=True)
+    browser_thread.start()
+    
+    print("\n" + "=" * 70)
+    print("Research RAG Web Server Starting...")
+    print(f"   Access URL: {url}")
+    print(f"   Mode: {settings.RETRIEVAL_MODE.upper()}")
+    print(f"   Generation Model: {settings.LLM_MODE.upper()}")
+    print(f"   Memory Retrieval: {'RF-Mem Dual-Path' if settings.ENABLE_RF_MEM else 'Standard'}")
+    print("=" * 70)
+    print("Press Ctrl+C to stop the server")
+    print("=" * 70 + "\n")
+    
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from web.server import app
+    
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 def main():
-    """主入口"""
+    """Main entry"""
     parser = argparse.ArgumentParser(
-        description="🔬 科研RAG系统 | 支持本地/在线模型混合部署",
+        description="Research RAG System | Supports local/online model hybrid deployment",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例:
-  # 快速模式 + 在线模型 (推荐8GB显存用户)
+Examples:
+  # Start web interface (recommended)
+  python main.py --web
+
+  # Fast mode + online model (recommended for 8GB VRAM users)
   python main.py --mode fast --model online
 
-  # 高精度模式 + 本地模型 (需大显存)
+  # High accuracy mode + local model (requires large VRAM)
   python main.py --mode accurate --model local
 
-  # 重建索引
+  # Rebuild index
   python main.py --rebuild
         """
     )
     parser.add_argument(
         "--rebuild",
         action="store_true",
-        help="强制重建向量数据库与BM25索引"
+        help="Force rebuild vector database and BM25 index"
     )
     parser.add_argument(
         "--mode",
         choices=["fast", "balanced", "accurate"],
         default="fast",
-        help="检索策略模式 (默认: fast)"
+        help="Retrieval strategy mode (default: fast)"
     )
     parser.add_argument(
         "--model",
         choices=["local", "online"],
         default=None,
-        help="生成模型来源 (默认: 读取.env配置)"
+        help="Generation model source (default: read from .env)"
+    )
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Start web interface with browser auto-open"
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="Web server host (default: 0.0.0.0)"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Web server port (default: 8000)"
     )
 
     args = parser.parse_args()
 
-    # 应用命令行配置
+    # Apply command line configuration
     if args.mode:
         settings.RETRIEVAL_MODE = args.mode
         apply_mode_preset(args.mode)
 
     if args.model:
         settings.LLM_MODE = args.model
-        logger.info(f"🔧 命令行指定生成模型: {args.model.upper()}")
+        logger.info(f"Command line specified generation model: {args.model.upper()}")
 
-    # 执行主逻辑
+    # Execute main logic
     if args.rebuild:
         rebuild_index()
+    elif args.web:
+        run_web_server(host=args.host, port=args.port)
     else:
         run_interactive()
 
 
 if __name__ == "__main__":
-    # 配置日志格式
+    # Configure log format
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -344,7 +541,7 @@ if __name__ == "__main__":
         ]
     )
 
-    # 抑制不必要的警告
+    # Suppress unnecessary warnings
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("chromadb").setLevel(logging.WARNING)
 
