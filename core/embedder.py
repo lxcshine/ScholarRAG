@@ -13,12 +13,12 @@ logger = logging.getLogger(__name__)
 
 class SafeOllamaEmbeddings(Embeddings):
     """
-    生产级 Ollama 嵌入包装器（修复 NaN/500 崩溃）
-    特性: 严格清洗 + 异常兜底 + 缓存 + 维度对齐
+    Production-grade Ollama embedding wrapper (fixes NaN/500 crashes)
+    Features: Strict sanitization + exception fallback + caching + dimension alignment
     """
 
     def __init__(self, model: str = None, base_url: str = None, max_length: int = None):
-        self.model = "bge-m3"
+        self.model = "qwen3-embedding:0.6b"
         self.base_url = settings.OLLAMA_BASE_URL
         self.max_length = max_length or settings.EMBEDDING_MAX_LENGTH
         self._client = OllamaEmbeddings(model=self.model, base_url=self.base_url)
@@ -30,19 +30,22 @@ class SafeOllamaEmbeddings(Embeddings):
 
         self._cache: Dict[str, tuple] = {}
         self.cache_ttl = settings.CACHE_TTL_SECONDS
-        logger.info(f"✅ 嵌入模型初始化: {self.model} (本地, 维度=1024)")
+        logger.info(f"Embedding model initialized: {self.model} (local, dim=1024)")
 
     def _sanitize(self, text: str) -> str:
-        """严格清洗文本，防止触发 Ollama 的 NaN Bug"""
+        """Strictly sanitize text to prevent Ollama NaN Bug"""
         if not isinstance(text, str):
             text = str(text)
-        # 1. 移除控制字符 & 不可见符号
+        # 1. Remove control characters & invisible symbols
         text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
-        # 2. 规范化空白
+        # 2. Normalize whitespace
         text = re.sub(r'\s+', ' ', text).strip()
-        # 3. 替换已知触发词
-        text = text.replace('NaN', 'NotANumber').replace('Infinity', 'Inf').replace('-Infinity', 'NegInf')
-        # 4. 最小长度保护
+        # 3. Replace all NaN variants (case-insensitive, word boundaries)
+        text = re.sub(r'(?i)\bnan\b', 'NotANumber', text)
+        text = re.sub(r'(?i)\bnull\b', 'NullValue', text)
+        text = re.sub(r'(?i)\bnone\b', 'NoneValue', text)
+        text = text.replace('Infinity', 'Inf').replace('-Infinity', 'NegInf')
+        # 4. Minimum length protection
         if len(text) < 3:
             return "[MINIMAL_VALID_TEXT]"
         return text
@@ -78,14 +81,14 @@ class SafeOllamaEmbeddings(Embeddings):
             clean_text = self._sanitize(raw_text)
             cache_key = hashlib.md5(f"{self.model}:{clean_text[:500]}".encode()).hexdigest()
 
-            # 缓存命中
+            # Cache hit
             if cache_key in self._cache:
                 vec, ts = self._cache[cache_key]
                 if current_time - ts < self.cache_ttl:
                     results.append(vec)
                     continue
 
-            # 执行嵌入
+            # Execute embedding
             chunks = self._chunk_text(clean_text)
             vec = None
             try:
@@ -100,9 +103,9 @@ class SafeOllamaEmbeddings(Embeddings):
                 results.append(vec)
 
             except Exception as e:
-                # 捕获 Ollama 500 / NaN / 网络超时等所有异常
-                logger.warning(f"⚠️ 嵌入失败 (chunk {i}): {str(e)[:80]} | 使用零向量兜底")
-                # bge-m3 固定输出 1024 维
+                # Catch all exceptions: Ollama 500 / NaN / network timeout
+                logger.warning(f"Embedding failed (chunk {i}): {str(e)[:80]} | Using zero vector fallback")
+                # qwen3-embedding fixed output 1024 dimensions
                 vec = [0.0] * 1024
                 results.append(vec)
 
