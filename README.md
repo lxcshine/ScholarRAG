@@ -63,7 +63,7 @@ cd ScholarRAG
 pip install -r requirements.txt
 
 # 启动Ollama并拉取学术嵌入模型
-ollama pull bge-m3
+ollama pull qwen3-embedding:0.6b
 ollama serve
 
 # 将 CVPR/IEEE 等 PDF 放入 ./papers 目录
