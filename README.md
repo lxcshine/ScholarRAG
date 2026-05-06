@@ -43,6 +43,16 @@ A Production-Grade Academic RAG Framework for CVPR/IEEE/NeurIPS Literature
 
 ---
 
+### Web 界面
+
+- **多会话管理**：新建、切换、重命名、删除历史对话
+- **快捷操作**：一键生成论文摘要、方法对比、局限性分析
+- **实时流式输出**：SSE 协议支持，逐 Token 显示生成过程
+- **引用溯源**：每个回答附带引用文献列表，点击查看详情
+- **主题切换**：Dark / Light 双主题
+- **检索模式切换**：Fast / Balanced / Accurate 三档
+- **模型切换**：Online (GLM-4) / Local (Ollama)
+
 ## 快速开始
 
 ### 环境准备
@@ -63,12 +73,3 @@ python main.py --rebuild --mode fast
 # 启动交互式问答系统
 python main.py --mode fast
 
-### Web 界面
-
-- **多会话管理**：新建、切换、重命名、删除历史对话
-- **快捷操作**：一键生成论文摘要、方法对比、局限性分析
-- **实时流式输出**：SSE 协议支持，逐 Token 显示生成过程
-- **引用溯源**：每个回答附带引用文献列表，点击查看详情
-- **主题切换**：Dark / Light 双主题
-- **检索模式切换**：Fast / Balanced / Accurate 三档
-- **模型切换**：Online (GLM-4) / Local (Ollama)
